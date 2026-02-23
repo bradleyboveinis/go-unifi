@@ -308,6 +308,19 @@ func FindOwnerHost(hostList *UnifiHostList) *UnifiHost {
 }
 
 func (c *ApiClient) setAPIUrlStyle(ctx context.Context) error {
+	// API keys are a UniFi OS-only feature and only work with the new-style
+	// /proxy/network path. Skip the unauthenticated HTTP probe for direct API
+	// key connections because newer UniFi OS firmware returns 302 for GET /,
+	// which would otherwise cause the probe to incorrectly set the old-style
+	// apiPath ("/") instead of "/proxy/network".
+	// Cloud connector connections are excluded here because setCloudConsoleID
+	// already configures the correct apiPath before this function is called.
+	if c.apiKey != "" && c.cloudConsoleID == "" {
+		c.apiPath = "/proxy/network"
+		c.loginPath = loginPathNew
+		return nil
+	}
+
 	// check if new style API
 	// this is modified from the unifi-poller (https://github.com/unifi-poller/unifi) implementation.
 	// see https://github.com/unifi-poller/unifi/blob/4dc44f11f61a2e08bf7ec5b20c71d5bced837b5d/unifi.go#L101-L104

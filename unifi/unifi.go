@@ -3,17 +3,22 @@ package unifi //
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"path"
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
 )
@@ -25,47 +30,110 @@ const (
 	loginPathNew = "/api/auth/login"
 )
 
-type LoginRequiredError struct{}
-
-func (err *LoginRequiredError) Error() string {
-	return "login required"
+// Config holds all configuration for creating a new ApiClient.
+type Config struct {
+	BaseURL        string
+	APIKey         string
+	Username       string
+	Password       string
+	AllowInsecure  bool
+	CloudConnector bool
+	HardwareID     string
+	Logger         any
+	TimeoutSeconds *int
+	RetryMax       *int
 }
 
-type NotFoundError struct {
-	Type  string
-	Attr  string
-	Value string
-}
-
-func (err *NotFoundError) Error() string {
-	if err.Attr != "" && err.Value != "" {
-		return fmt.Sprintf("not found: type=%s, attr=%s, value=%s", err.Type, err.Attr, err.Value)
-	} else {
-		return fmt.Sprintf("not found: type=%s", err.Type)
+// New creates a fully initialized ApiClient from the provided configuration.
+// For cloud connector mode, set CloudConnector=true and optionally HardwareID.
+// For direct connection, provide BaseURL and either APIKey or Username/Password.
+func New(ctx context.Context, cfg *Config) (*ApiClient, error) {
+	c := retryablehttp.NewClient()
+	timeoutSeconds := 30
+	if cfg.TimeoutSeconds != nil {
+		timeoutSeconds = *cfg.TimeoutSeconds
 	}
-}
+	c.HTTPClient.Timeout = time.Duration(timeoutSeconds) * time.Second
 
-type APIError struct {
-	RC      string
-	Message string
-}
+	if cfg.Logger != nil {
+		c.Logger = cfg.Logger
+	} else {
+		c.Logger = nil
+	}
 
-func (err *APIError) Error() string {
-	return err.Message
+	if cfg.RetryMax != nil {
+		c.RetryMax = *cfg.RetryMax
+	}
+
+	if cfg.AllowInsecure {
+		transport := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: time.Duration(timeoutSeconds) * time.Second,
+			}).DialContext,
+		}
+		c.HTTPClient.Transport = transport
+	}
+
+	jar, _ := cookiejar.New(nil)
+	c.HTTPClient.Jar = jar
+
+	client := &ApiClient{
+		c:        c,
+		apiKey:   cfg.APIKey,
+		username: cfg.Username,
+		password: cfg.Password,
+	}
+
+	if cfg.CloudConnector {
+		var err error
+		if cfg.HardwareID != "" {
+			_, err = client.enableCloudConnectorByHardwareID(ctx, cfg.HardwareID)
+		} else {
+			_, err = client.enableCloudConnector(ctx, -1)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("unable to enable cloud connector: %w", err)
+		}
+	} else {
+		if err := client.setBaseURL(cfg.BaseURL); err != nil {
+			return nil, fmt.Errorf("invalid base URL: %w", err)
+		}
+	}
+
+	if err := client.setAPIUrlStyle(ctx); err != nil {
+		return nil, fmt.Errorf("unable to determine API URL style: %w", err)
+	}
+
+	if cfg.Username != "" && cfg.Password != "" && client.apiKey == "" {
+		if err := client.login(ctx); err != nil {
+			return nil, fmt.Errorf("unable to login: %w", err)
+		}
+	}
+
+	if err := client.setServerVersion(ctx); err != nil {
+		return nil, fmt.Errorf("unable to determine server version: %w", err)
+	}
+
+	return client, nil
 }
 
 type ApiClient struct {
-	// single thread client calls for CSRF, etc.
-	sync.Mutex
+	loginMu sync.RWMutex // serializes non-apiKey requests for CSRF token propagation
 
 	c       *retryablehttp.Client
 	baseURL *url.URL
 
 	apiKey    string
+	username  string
+	password  string
 	loginPath string
 	apiPath   string // path to API, e.g. "proxy/network" for new style API, "/api" for old style API
 
-	csrf string
+	csrf        string
+	tokenExpiry time.Time
+	loginErr    error // cached login error to prevent retry storms
 
 	version string
 
@@ -73,19 +141,38 @@ type ApiClient struct {
 	cloudConsoleID string // Console ID for Cloud Connector API proxy
 }
 
-func (c *ApiClient) CSRFToken() string {
-	return c.csrf
-}
-
 func (c *ApiClient) Version() string {
 	return c.version
 }
 
-func (c *ApiClient) SetAPIKey(apiKey string) {
-	c.apiKey = apiKey
+// isNewStyle returns true if the client is configured for UniFi OS authentication
+// (TOKEN cookie + X-CSRF-Token via /api/auth/login). Returns false for standalone
+// Network Application authentication (unifises cookie via /api/login).
+func (c *ApiClient) isNewStyle() bool {
+	return c.loginPath == loginPathNew
 }
 
-func (c *ApiClient) SetBaseURL(base string) error {
+// isLoggedIn checks whether the client has a valid authentication session.
+// For UniFi OS (new-style): checks for a non-empty CSRF token.
+// For standalone (old-style): checks the cookiejar for a unifises session cookie.
+func (c *ApiClient) isLoggedIn() bool {
+	if c.isNewStyle() {
+		return c.csrf != ""
+	}
+	return c.hasCookie("unifises")
+}
+
+// hasCookie checks if the cookiejar contains a cookie with the given name.
+func (c *ApiClient) hasCookie(name string) bool {
+	if c.baseURL == nil {
+		return false
+	}
+	return slices.ContainsFunc(c.c.HTTPClient.Jar.Cookies(c.baseURL), func(cookie *http.Cookie) bool {
+		return cookie.Name == name
+	})
+}
+
+func (c *ApiClient) setBaseURL(base string) error {
 	var err error
 	c.baseURL, err = url.Parse(base)
 	if err != nil {
@@ -100,14 +187,9 @@ func (c *ApiClient) SetBaseURL(base string) error {
 	return nil
 }
 
-func (c *ApiClient) SetHTTPClient(hc *retryablehttp.Client) error {
-	c.c = hc
-	return nil
-}
-
-// GetHosts retrieves the list of UniFi hosts from the Site Manager API.
+// getHosts retrieves the list of UniFi hosts from the Site Manager API.
 // This requires an API key and is typically the first step in using the Cloud Connector API.
-func (c *ApiClient) GetHosts(ctx context.Context) (*UnifiHostList, error) {
+func (c *ApiClient) getHosts(ctx context.Context) (*UnifiHostList, error) {
 	if c.apiKey == "" {
 		return nil, errors.New("API key required to fetch hosts from Site Manager API")
 	}
@@ -121,10 +203,10 @@ func (c *ApiClient) GetHosts(ctx context.Context) (*UnifiHostList, error) {
 	return &hostList, nil
 }
 
-// SetCloudConsoleID configures the client to use the Cloud Connector API for all requests.
+// setCloudConsoleID configures the client to use the Cloud Connector API for all requests.
 // When set, all API calls will be proxied through https://api.ui.com/v1/connector/consoles/{consoleId}/proxy/...
 // This requires an API key and console firmware >= 5.0.3.
-func (c *ApiClient) SetCloudConsoleID(consoleID string) {
+func (c *ApiClient) setCloudConsoleID(consoleID string) {
 	c.cloudConsoleID = consoleID
 	if consoleID != "" {
 		// When using cloud connector, force the base URL to api.ui.com
@@ -138,14 +220,14 @@ func (c *ApiClient) GetCloudConsoleID() string {
 	return c.cloudConsoleID
 }
 
-// EnableCloudConnector fetches available hosts and configures the client to use
+// enableCloudConnector fetches available hosts and configures the client to use
 // the Cloud Connector API. Selection priority:
 // 1. If hostIndex >= 0: uses the host at that index
 // 2. If hostIndex < 0: defaults to the first host where owner=true
 // 3. Falls back to the first host if no owner found
 // Returns the selected console ID and any error encountered.
-func (c *ApiClient) EnableCloudConnector(ctx context.Context, hostIndex int) (string, error) {
-	hosts, err := c.GetHosts(ctx)
+func (c *ApiClient) enableCloudConnector(ctx context.Context, hostIndex int) (string, error) {
+	hosts, err := c.getHosts(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -173,21 +255,15 @@ func (c *ApiClient) EnableCloudConnector(ctx context.Context, hostIndex int) (st
 		}
 	}
 
-	c.SetCloudConsoleID(selectedHost.ID)
+	c.setCloudConsoleID(selectedHost.ID)
 	return selectedHost.ID, nil
 }
 
-// EnableCloudConnectorByID configures the client to use the Cloud Connector API
-// with a specific console ID without fetching the hosts list.
-func (c *ApiClient) EnableCloudConnectorByID(consoleID string) {
-	c.SetCloudConsoleID(consoleID)
-}
-
-// EnableCloudConnectorByHardwareID fetches available hosts and configures the client
+// enableCloudConnectorByHardwareID fetches available hosts and configures the client
 // to use the Cloud Connector API with the host matching the specified hardware ID.
 // Returns the selected console ID and any error encountered.
-func (c *ApiClient) EnableCloudConnectorByHardwareID(ctx context.Context, hardwareID string) (string, error) {
-	hosts, err := c.GetHosts(ctx)
+func (c *ApiClient) enableCloudConnectorByHardwareID(ctx context.Context, hardwareID string) (string, error) {
+	hosts, err := c.getHosts(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -197,7 +273,7 @@ func (c *ApiClient) EnableCloudConnectorByHardwareID(ctx context.Context, hardwa
 		return "", fmt.Errorf("no host found with hardware ID: %s", hardwareID)
 	}
 
-	c.SetCloudConsoleID(host.ID)
+	c.setCloudConsoleID(host.ID)
 	return host.ID, nil
 }
 
@@ -231,30 +307,38 @@ func FindOwnerHost(hostList *UnifiHostList) *UnifiHost {
 	return nil
 }
 
-// DisableCloudConnector disables Cloud Connector mode and returns to direct API access.
-// Note: You will need to reconfigure the base URL for direct access.
-func (c *ApiClient) DisableCloudConnector() {
-	c.cloudConsoleID = ""
-}
-
 func (c *ApiClient) setAPIUrlStyle(ctx context.Context) error {
+	// API keys are a UniFi OS-only feature and only work with the new-style
+	// /proxy/network path. Skip the unauthenticated HTTP probe for direct API
+	// key connections because newer UniFi OS firmware returns 302 for GET /,
+	// which would otherwise cause the probe to incorrectly set the old-style
+	// apiPath ("/") instead of "/proxy/network".
+	// Cloud connector connections are excluded here because setCloudConsoleID
+	// already configures the correct apiPath before this function is called.
+	if c.apiKey != "" && c.cloudConsoleID == "" {
+		c.apiPath = "/proxy/network"
+		c.loginPath = loginPathNew
+		return nil
+	}
+
 	// check if new style API
 	// this is modified from the unifi-poller (https://github.com/unifi-poller/unifi) implementation.
 	// see https://github.com/unifi-poller/unifi/blob/4dc44f11f61a2e08bf7ec5b20c71d5bced837b5d/unifi.go#L101-L104
 	// and https://github.com/unifi-poller/unifi/commit/43a6b225031a28f2b358f52d03a7217c7b524143
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL.String(), nil)
+	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodGet, c.baseURL.String(), nil)
 	if err != nil {
 		return err
 	}
 
 	// We can't share these cookies with other requests, so make a new client.
 	// Checking the return code on the first request so don't follow a redirect.
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Transport: c.c.HTTPClient.Transport,
+	client := retryablehttp.NewClient()
+
+	client.HTTPClient.Timeout = c.c.HTTPClient.Timeout
+	client.HTTPClient.Transport = c.c.HTTPClient.Transport
+	client.HTTPClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 
 	resp, err := client.Do(req)
@@ -281,19 +365,55 @@ func (c *ApiClient) setAPIUrlStyle(ctx context.Context) error {
 	return errors.New("failed to get api url style")
 }
 
-func (c *ApiClient) Login(ctx context.Context, user, pass string) error {
-	if c.c == nil {
-		c.c = retryablehttp.NewClient()
-
-		jar, _ := cookiejar.New(nil)
-		c.c.HTTPClient.Jar = jar
+func (c *ApiClient) login(ctx context.Context) error {
+	// Clear stale session cookies before login; sending them causes errors.
+	if c.baseURL != nil {
+		c.c.HTTPClient.Jar.SetCookies(c.baseURL, []*http.Cookie{
+			{Name: "TOKEN", MaxAge: -1},
+			{Name: "unifises", MaxAge: -1},
+		})
 	}
+	c.csrf = ""
 
-	err := c.setAPIUrlStyle(ctx)
+	// Call doRequest directly to avoid login-check recursion and deadlock on loginMu.
+	err := c.doRequest(ctx, http.MethodPost, c.loginPath, &struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}{
+		Username: c.username,
+		Password: c.password,
+	}, nil)
 	if err != nil {
-		return fmt.Errorf("unable to determine API URL style: %w", err)
+		c.loginErr = err
+		return err
 	}
 
+	c.loginErr = nil
+	return nil
+}
+
+// ensureLoggedIn acquires an exclusive lock and performs login if needed.
+// Only one goroutine will attempt login; others wait and reuse the result.
+func (c *ApiClient) ensureLoggedIn(ctx context.Context) error {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+
+	// Double-check: another goroutine may have already logged in while we waited.
+	if c.isLoggedIn() && (c.tokenExpiry.IsZero() || time.Now().Before(c.tokenExpiry)) {
+		return nil
+	}
+
+	// If not logged in and a previous login already failed, don't retry.
+	if !c.isLoggedIn() && c.loginErr != nil {
+		return c.loginErr
+	}
+
+	// Clear any stale loginErr before attempting (e.g. token-expiry refresh).
+	c.loginErr = nil
+	return c.login(ctx)
+}
+
+func (c *ApiClient) setServerVersion(ctx context.Context) (err error) {
 	var status struct {
 		Meta struct {
 			ServerVersion string `json:"server_version"`
@@ -301,20 +421,7 @@ func (c *ApiClient) Login(ctx context.Context, user, pass string) error {
 		} `json:"meta"`
 	}
 
-	if c.apiKey == "" {
-		err = c.do(ctx, "POST", c.loginPath, &struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}{
-			Username: user,
-			Password: pass,
-		}, nil)
-		if err != nil {
-			return err
-		}
-	}
-
-	err = c.do(ctx, "GET", "status", nil, &status)
+	err = c.do(ctx, http.MethodGet, "status", nil, &status)
 	if err != nil {
 		return err
 	}
@@ -346,12 +453,43 @@ func (c *ApiClient) do(
 	reqBody any,
 	respBody any,
 ) error {
-	// single threading requests, this is mostly to assist in CSRF token propagation
-	if c.apiKey == "" {
-		c.Lock()
-		defer c.Unlock()
+	// For username/password auth, ensure we are logged in before making requests.
+	if c.apiKey == "" && c.username != "" && c.password != "" {
+		// Wait for any in-progress login to complete, then check if we need to login.
+		c.loginMu.RLock()
+		needsLogin := !c.isLoggedIn() || (!c.tokenExpiry.IsZero() && time.Now().After(c.tokenExpiry))
+		c.loginMu.RUnlock()
+
+		if needsLogin {
+			if err := c.ensureLoggedIn(ctx); err != nil {
+				return err
+			}
+		}
+
+		// Acquire read lock for the duration of the request (blocks while login is in progress).
+		c.loginMu.RLock()
+		defer c.loginMu.RUnlock()
+
+		// Verify authentication after awaiting the login semaphore.
+		if !c.isLoggedIn() {
+			if c.loginErr != nil {
+				return fmt.Errorf("login failed: %w", c.loginErr)
+			}
+			return &LoginRequiredError{}
+		}
 	}
 
+	return c.doRequest(ctx, method, relativeURL, reqBody, respBody)
+}
+
+// doRequest performs the actual HTTP request. It is separated from do so that
+// login can call it directly without triggering login-check recursion.
+func (c *ApiClient) doRequest(
+	ctx context.Context,
+	method, relativeURL string,
+	reqBody any,
+	respBody any,
+) error {
 	var (
 		reqReader io.Reader
 		err       error
@@ -393,7 +531,7 @@ func (c *ApiClient) do(
 	req.Header.Add("Content-Type", "application/json; charset=utf-8")
 
 	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+		req.Header.Set("X-Api-Key", c.apiKey)
 	} else if c.csrf != "" {
 		req.Header.Set("X-Csrf-Token", c.csrf)
 	}
@@ -405,15 +543,25 @@ func (c *ApiClient) do(
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		t := reflect.TypeOf(respBody)
+		var typeName string
+		if t := reflect.TypeOf(respBody); t != nil {
+			typeName = t.String()
+		}
 		return &NotFoundError{
-			Type: t.String(),
+			Type: typeName,
 		}
 	}
 
 	if c.apiKey == "" {
-		if csrf := resp.Header.Get("X-Csrf-Token"); csrf != "" {
-			c.csrf = resp.Header.Get("X-Csrf-Token")
+		if csrf := resp.Header.Get("X-Updated-Csrf-Token"); csrf != "" {
+			c.csrf = csrf
+		} else if csrf := resp.Header.Get("X-Csrf-Token"); csrf != "" {
+			c.csrf = csrf
+		}
+		if exp := resp.Header.Get("X-Token-Expire-Time"); exp != "" {
+			if ms, err := strconv.ParseInt(exp, 10, 64); err == nil {
+				c.tokenExpiry = time.UnixMilli(ms)
+			}
 		}
 	}
 

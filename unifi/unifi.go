@@ -479,21 +479,6 @@ func (c *ApiClient) do(
 		}
 	}
 
-	// When both API key and username/password are configured, try a session login
-	// for old-style v1 paths (api/s/...) which may not accept API key auth on
-	// newer UniFi OS firmware. This lets API key serve v2 endpoints while session
-	// auth covers v1 endpoints transparently.
-	if c.apiKey != "" && c.username != "" && c.password != "" &&
-		(strings.HasPrefix(relativeURL, "api/s/") || relativeURL == "status") {
-		c.loginMu.RLock()
-		needsLogin := !c.isLoggedIn() || (!c.tokenExpiry.IsZero() && time.Now().After(c.tokenExpiry))
-		c.loginMu.RUnlock()
-
-		if needsLogin {
-			_ = c.ensureLoggedIn(ctx) // best-effort; fall through to API key if login fails
-		}
-	}
-
 	return c.doRequest(ctx, method, relativeURL, reqBody, respBody)
 }
 
@@ -545,15 +530,11 @@ func (c *ApiClient) doRequest(
 	req.Header.Add("Accept", "application/json")
 	req.Header.Add("Content-Type", "application/json; charset=utf-8")
 
-	if c.apiKey != "" && c.csrf == "" {
-		// Use API key when no active session exists.
+	if c.apiKey != "" {
 		req.Header.Set("X-Api-Key", c.apiKey)
-	} else if c.csrf != "" {
-		// Prefer session CSRF token when available (covers v1 paths that don't
-		// accept API key auth on newer firmware).
+	}
+	if c.csrf != "" {
 		req.Header.Set("X-Csrf-Token", c.csrf)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-Api-Key", c.apiKey)
 	}
 
 	resp, err := c.c.Do(req)
@@ -572,16 +553,14 @@ func (c *ApiClient) doRequest(
 		}
 	}
 
-	if c.apiKey == "" {
-		if csrf := resp.Header.Get("X-Updated-Csrf-Token"); csrf != "" {
-			c.csrf = csrf
-		} else if csrf := resp.Header.Get("X-Csrf-Token"); csrf != "" {
-			c.csrf = csrf
-		}
-		if exp := resp.Header.Get("X-Token-Expire-Time"); exp != "" {
-			if ms, err := strconv.ParseInt(exp, 10, 64); err == nil {
-				c.tokenExpiry = time.UnixMilli(ms)
-			}
+	if csrf := resp.Header.Get("X-Updated-Csrf-Token"); csrf != "" {
+		c.csrf = csrf
+	} else if csrf := resp.Header.Get("X-Csrf-Token"); csrf != "" {
+		c.csrf = csrf
+	}
+	if exp := resp.Header.Get("X-Token-Expire-Time"); exp != "" {
+		if ms, err := strconv.ParseInt(exp, 10, 64); err == nil {
+			c.tokenExpiry = time.UnixMilli(ms)
 		}
 	}
 

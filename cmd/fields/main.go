@@ -190,6 +190,8 @@ func NewResource(structName string, resourcePath string) *ResourceInfo {
 		baseType.Fields["Model"] = NewFieldInfo("Model", "model", fields.String, "", true, false, false, "")
 		baseType.Fields["State"] = NewFieldInfo("State", "state", "DeviceState", "", false, false, false, "")
 		baseType.Fields["Type"] = NewFieldInfo("Type", "type", fields.String, "", true, false, false, "")
+		baseType.Fields["InformIP"] = NewFieldInfo("InformIP", "inform_ip", fields.String, "", true, false, false, "")
+		baseType.Fields["IP"] = NewFieldInfo("IP", "ip", fields.String, "", true, false, false, "")
 	case resource.StructName == "Client":
 		baseType.Fields[" DisplayName"] = NewFieldInfo("DisplayName", "display_name", fields.String, "non-generated field", true, false, false, "")
 	case resource.StructName == "WLAN":

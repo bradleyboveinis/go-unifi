@@ -56,6 +56,8 @@ type Device struct {
 	HardwareOffload             bool                      `json:"hardware_offload,omitempty"`
 	HeightInMeters              float64                   `json:"heightInMeters,omitempty"`
 	Hostname                    string                    `json:"hostname,omitempty"` // .{1,128}
+	IP                          string                    `json:"ip,omitempty"`
+	InformIP                    string                    `json:"inform_ip,omitempty"`
 	JumboframeEnabled           bool                      `json:"jumboframe_enabled,omitempty"`
 	LcmBrightness               *int64                    `json:"lcm_brightness,omitempty"` // [1-9]|[1-9][0-9]|100
 	LcmBrightnessOverride       bool                      `json:"lcm_brightness_override,omitempty"`

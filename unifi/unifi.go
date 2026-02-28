@@ -566,7 +566,7 @@ func (c *ApiClient) doRequest(
 
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusUnauthorized {
-			return &LoginRequiredError{}
+			return &LoginRequiredError{APIKey: c.apiKey != ""}
 		}
 		errBody := struct {
 			Meta meta `json:"meta"`

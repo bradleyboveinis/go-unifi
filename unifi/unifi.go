@@ -102,9 +102,8 @@ func New(ctx context.Context, cfg *Config) (*ApiClient, error) {
 		}
 	}
 
-	if err := client.setAPIUrlStyle(ctx); err != nil {
-		return nil, fmt.Errorf("unable to determine API URL style: %w", err)
-	}
+	// setAPIUrlStyle is best-effort; API key connections pre-configure the path.
+	_ = client.setAPIUrlStyle(ctx)
 
 	if cfg.Username != "" && cfg.Password != "" && client.apiKey == "" {
 		if err := client.login(ctx); err != nil {
@@ -112,9 +111,8 @@ func New(ctx context.Context, cfg *Config) (*ApiClient, error) {
 		}
 	}
 
-	if err := client.setServerVersion(ctx); err != nil {
-		return nil, fmt.Errorf("unable to determine server version: %w", err)
-	}
+	// setServerVersion is best-effort; version info is not required for operation.
+	_ = client.setServerVersion(ctx)
 
 	return client, nil
 }
@@ -210,8 +208,10 @@ func (c *ApiClient) setCloudConsoleID(consoleID string) {
 	c.cloudConsoleID = consoleID
 	if consoleID != "" {
 		// When using cloud connector, force the base URL to api.ui.com
+		// and default to new-style paths (cloud connector is always UniFi OS).
 		c.baseURL, _ = url.Parse("https://api.ui.com")
 		c.apiPath = "/proxy/network"
+		c.loginPath = loginPathNew
 	}
 }
 
@@ -309,13 +309,13 @@ func FindOwnerHost(hostList *UnifiHostList) *UnifiHost {
 
 func (c *ApiClient) setAPIUrlStyle(ctx context.Context) error {
 	// API keys are a UniFi OS-only feature and only work with the new-style
-	// /proxy/network path. Skip the unauthenticated HTTP probe for direct API
-	// key connections because newer UniFi OS firmware returns 302 for GET /,
+	// /proxy/network path. Skip the unauthenticated HTTP probe for API key
+	// connections because newer UniFi OS firmware returns 302 for GET /,
 	// which would otherwise cause the probe to incorrectly set the old-style
 	// apiPath ("/") instead of "/proxy/network".
-	// Cloud connector connections are excluded here because setCloudConsoleID
-	// already configures the correct apiPath before this function is called.
-	if c.apiKey != "" && c.cloudConsoleID == "" {
+	// This also covers cloud connector mode, which requires an API key and
+	// has paths already configured by setCloudConsoleID.
+	if c.apiKey != "" {
 		c.apiPath = "/proxy/network"
 		c.loginPath = loginPathNew
 		return nil
@@ -453,7 +453,7 @@ func (c *ApiClient) do(
 	reqBody any,
 	respBody any,
 ) error {
-	// For username/password auth, ensure we are logged in before making requests.
+	// For username/password auth (no API key), ensure we are logged in before making requests.
 	if c.apiKey == "" && c.username != "" && c.password != "" {
 		// Wait for any in-progress login to complete, then check if we need to login.
 		c.loginMu.RLock()
@@ -532,7 +532,8 @@ func (c *ApiClient) doRequest(
 
 	if c.apiKey != "" {
 		req.Header.Set("X-Api-Key", c.apiKey)
-	} else if c.csrf != "" {
+	}
+	if c.csrf != "" {
 		req.Header.Set("X-Csrf-Token", c.csrf)
 	}
 
@@ -552,22 +553,20 @@ func (c *ApiClient) doRequest(
 		}
 	}
 
-	if c.apiKey == "" {
-		if csrf := resp.Header.Get("X-Updated-Csrf-Token"); csrf != "" {
-			c.csrf = csrf
-		} else if csrf := resp.Header.Get("X-Csrf-Token"); csrf != "" {
-			c.csrf = csrf
-		}
-		if exp := resp.Header.Get("X-Token-Expire-Time"); exp != "" {
-			if ms, err := strconv.ParseInt(exp, 10, 64); err == nil {
-				c.tokenExpiry = time.UnixMilli(ms)
-			}
+	if csrf := resp.Header.Get("X-Updated-Csrf-Token"); csrf != "" {
+		c.csrf = csrf
+	} else if csrf := resp.Header.Get("X-Csrf-Token"); csrf != "" {
+		c.csrf = csrf
+	}
+	if exp := resp.Header.Get("X-Token-Expire-Time"); exp != "" {
+		if ms, err := strconv.ParseInt(exp, 10, 64); err == nil {
+			c.tokenExpiry = time.UnixMilli(ms)
 		}
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusUnauthorized {
-			return &LoginRequiredError{}
+			return &LoginRequiredError{APIKey: c.apiKey != ""}
 		}
 		errBody := struct {
 			Meta meta `json:"meta"`

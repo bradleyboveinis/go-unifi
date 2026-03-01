@@ -157,3 +157,22 @@ func (c *ApiClient) GetClientInfo(ctx context.Context, site string, mac string) 
 
 	return &respBody, nil
 }
+
+// ListClientHistory returns all historical clients, including offline devices.
+// The withinHours parameter controls how far back to look (0 = all time).
+func (c *ApiClient) ListClientHistory(ctx context.Context, site string, withinHours int) ([]ClientInfo, error) {
+	var respBody []ClientInfo
+
+	err := c.do(
+		ctx,
+		"GET",
+		fmt.Sprintf("v2/api/site/%s/clients/history?onlyNonBlocked=false&includeUnifiDevices=true&withinHours=%d", site, withinHours),
+		nil,
+		&respBody,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return respBody, nil
+}

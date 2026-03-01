@@ -2,9 +2,14 @@ package unifi
 
 import "fmt"
 
-type LoginRequiredError struct{}
+type LoginRequiredError struct {
+	APIKey bool // true when the rejection is for an API-key request
+}
 
 func (err *LoginRequiredError) Error() string {
+	if err.APIKey {
+		return "API key rejected (HTTP 401): check that the key is valid and has not been revoked"
+	}
 	return "login required"
 }
 
